@@ -49,6 +49,67 @@ func NewSourceFile(projectName, filePath string) *SourceFile {
 	}
 }
 
+// Extract is for use by custom code scanner
+func (f *SourceFile) Extract(options ...SourceFileOption) (string, bool, []string, []string, []string, []string, error) {
+	var packageName string
+	var hasMain bool
+	for _, option := range options {
+		err := option(f)
+		if err != nil {
+			return packageName, hasMain, nil, nil, nil, nil, err
+		}
+	}
+	var originalContent []byte
+	var err error
+	if f.filePath == StandardInput {
+		originalContent, err = io.ReadAll(os.Stdin)
+	} else {
+		originalContent, err = os.ReadFile(f.filePath)
+	}
+	if err != nil {
+		return packageName, hasMain, nil, nil, nil, nil, err
+	}
+
+	fset := token.NewFileSet()
+
+	pf, err := parser.ParseFile(fset, "", originalContent, parser.ParseComments)
+	if err != nil {
+		return packageName, hasMain, nil, nil, nil, nil, err
+	}
+
+	importsWithMetadata, err := f.parseImports(pf)
+	if err != nil {
+		return packageName, hasMain, nil, nil, nil, nil, err
+	}
+
+	stdImports, generalImports, projectLocalPkgs, projectImports := groupImports(
+		f.projectName,
+		f.companyPackagePrefixes,
+		importsWithMetadata,
+	)
+
+	decls, ok := hasMultipleImportDecls(pf)
+	if ok {
+		pf.Decls = decls
+	}
+
+	f.fixImports(pf, stdImports, generalImports, projectLocalPkgs, projectImports, importsWithMetadata)
+
+	packageName = pf.Name.Name
+
+	for _, decl := range pf.Decls {
+		switch dd := decl.(type) {
+		case *ast.FuncDecl:
+			if dd.Name.Name == "main" {
+				hasMain = true
+			}
+		}
+	}
+
+	// Including Package Name and check if "main" func exists
+	return packageName, hasMain, stdImports, generalImports, projectLocalPkgs, projectImports, err
+}
+
 // Fix is for revise imports and format the code
 func (f *SourceFile) Fix(options ...SourceFileOption) ([]byte, bool, error) {
 	for _, option := range options {
@@ -277,8 +338,10 @@ func (f *SourceFile) fixImports(
 // to
 // -----
 // import (
-// 	"fmt"
+//
+//	"fmt"
 //	"io"
+//
 // )
 func hasMultipleImportDecls(f *ast.File) ([]ast.Decl, bool) {
 	importSpecs := make([]ast.Spec, 0, len(f.Imports))
